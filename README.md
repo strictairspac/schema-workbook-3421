@@ -44,6 +44,20 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 
 这是小型关系模型设计辅助工具，FD由人工提供，不能从脏数据自动推断业务规则；不连接生产数据或自动执行DDL。精确投影在10属性内有界，仍可能随依赖复杂度增加耗时。单worker串行队列，不带生产任务重试/崩溃续跑。
 
+## 外键盘点（父表 / 明细表）
+
+检测项撤销后，旧委托明细仍会挂在已不存在的检测项下。这一功能把拆解报告落成一次**盘点式外键启用**：
+
+1. **选表取键**：从一份已完成报告选择父表（被引用）与明细表（引用方）；外键键取报告中父关系的候选键，且必须是明细表包含的那一组。父/明细默认存为 `rpt{报告}p{序}`、`rpt{报告}d{序}`（键值与属性名分隔存于 `c1..cn`），也可自定表名。
+2. **载入历史行**：两表历史行在创建时冻结到盘点记录，随后写入物理表；旧孤儿**保留原行**，只在 `fk_orphans` 登记待补挂，不删不改。
+3. **可续跑盘点**：按 `_row_id` 游标分批扫描并逐批提交，中断后再次调用从游标继续；`restart` 清空待补挂记录后重扫。孤儿数以物理表 LEFT JOIN 实时核对，修好/删除的原行自动销账。
+4. **库内守卫**：明细表 BEFORE INSERT/UPDATE 用锁定读校验父行，父表 BEFORE DELETE/UPDATE 拦截仍被引用的行。因此盘点期间照常录入合法明细，新增孤儿与误删被引用的父行都会被数据库拒绝；并发补挂与删父行按“先父后明细”的顺序加锁。
+5. **补挂**：对单条孤儿补齐父键即可；父行缺失时可选择新建父行再补挂。孤儿清零是启用前置条件。
+6. **幂等切换**：启用前用 `GET_LOCK` 串行化；已存在同名外键先清理再装，重试不会重复装约束。装好后回查 `information_schema`，确认外键真实存在才标记已启用并撤下守卫。任何一步失败都会回滚外键、恢复守卫，**已录入的行原样保留**，状态置为 `failed` 可重试。
+7. **页面**：报告详情页提供“待盘点 / 待补挂 / 已启用 / 孤儿所在行”四个视图；孤儿视图列出保留的原行及其待补挂记录。
+
+状态：`pending → scanning → awaiting_relink / ready → enabled`，失败为 `failed`。外键启用后该盘点的录入/补挂接口关闭，改走正式表。
+
 ## 工程结构
 
 |服务|技术|职责|
@@ -51,12 +65,14 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 |frontend|原生HTML/CSS/JS + Nginx|4业务页、登录、共享业务表格与报告组件|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照与导出|
 |worker|Python3.11|闭包、候选键、3NF与chase|
-|db|MySQL8.0|JSON属性与依赖、任务报告|
+|db|MySQL8.0|JSON属性与依赖、任务报告、盘点表与外键守卫|
 |redis|Redis7|持久任务队列|
 
-目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
+目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。外键盘点贯穿 `models/entities.py`（FkRollout/FkOrphan）、`services/rollouts.py`、`routes/rollouts.py`、`schemas/rollout.py`、前端 `api/rollouts.js`、`stores/rollouts.js`、`pages/rollout.js`。
 
-枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
+API：`GET/POST /rollouts`、`GET /rollouts/{id}`、`POST /rollouts/{id}/inventory`（可带 `max_rows`/`chunk_size`/`restart`）、`GET /rollouts/{id}/orphans`、`GET /rollouts/{id}/rows`、`POST /rollouts/{id}/relink`、`POST /rollouts/{id}/details`、`POST /rollouts/{id}/parents`、`DELETE /rollouts/{id}/parents`、`POST /rollouts/{id}/enable`（`dry_run`）。
+
+枚举：角色admin/operator/viewer、任务queued/running/completed/failed、盘点pending/scanning/awaiting_relink/ready/enabled/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
 
 环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化，无在线迁移引擎。
 
